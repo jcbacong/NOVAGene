@@ -1,11 +1,8 @@
 #!/bin/bash
-#SBATCH --partition batch
-#SBATCH --qos batch_default
 #SBATCH --job-name=correxpv2    
 #SBATCH --output=log_%A_%a_%x.out      # Output file, with job name, job ID, and array task ID
 #SBATCH --error=log_%A_%a_%x.err       # Error file
 #SBATCH --mail-type BEGIN,FAIL,END
-#SBATCH --mail-user jcbacong@up.edu.ph
 #SBATCH --mem 90G
 
 # Load any necessary modules (e.g., for Conda if it’s not automatically available)

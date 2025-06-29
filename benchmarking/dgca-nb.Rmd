@@ -1,0 +1,1947 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Comparison of Methods
+
+Here we want to determine the precision and recall of our methods using the synthetic datasets.
+
+# A. Synthetic data with low and high variability
+
+```{r}
+# install.packages("MASS")
+# install.packages("ggplot2")
+# install.packages("dplyr")
+# install.packages("tidyr")
+# install.packages("sf") # New dependency for geometric operations (overlap calculation)
+
+library(MASS) # For mvrnorm
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(sf) # For spatial data operations to calculate ellipse overlap
+
+# --- 1. Define Dataset Parameters ---
+num_genes <- 300 # N = 300 genes
+samples_per_condition <- 50 # M = 50 samples per condition
+num_conditions <- 2 # Conditions Healthy and Diseased
+num_modules <- 10 # Number of predefined gene modules
+
+# Set a seed for reproducibility
+set.seed(42)
+
+# --- 2. Assign Known Module Membership to Genes ---
+# Each gene is assigned to one of the 'num_modules'.
+# Genes are divided equally among modules.
+genes_per_module <- num_genes %/% num_modules # Integer division
+gene_ids <- paste0("Gene_", 1:num_genes)
+
+# Create module assignments (e.g., Gene_001 to Gene_030 are Module_1, etc.)
+module_nums <- ((0:(num_genes-1)) %/% genes_per_module) + 1
+gene_module_membership <- data.frame(
+    Gene = gene_ids,
+    Module = paste0("Module_", module_nums)
+)
+
+cat("--- Gene Module Membership (first 10 genes) ---\n")
+print(head(gene_module_membership, 10))
+cat(paste0(rep("-", 50), collapse = ""), "\n\n")
+
+# --- 3. Define Parameters for Mean Expression Profiles and Overlap on LOG SCALE ---
+# These parameters now refer to the log-transformed gene expression values.
+log_baseline_mean <- log(10.0) # Base mean expression level on log scale (e.g., log(10) = 2.3)
+
+# Magnitude of the module-specific effect on the LOG scale.
+# A smaller value here means less separation on the log scale, leading to more overlap
+# in the PCA space of the final, exponentiated data.
+log_module_effect_magnitude <- 0.9 # This value is high, expecting low overlap.
+# log_module_effect_magnitude <- 0.1 # High overlap
+
+# New: Parameter for nonlinear (cubic) correlation strength
+# This controls the magnitude of the shared cubic effect within modules.
+# A small value is recommended as cubic terms grow rapidly.
+nonlinear_correlation_strength <- 0.1 # Adjust this value to control the cubic effect's magnitude
+
+# --- 4. Construct Covariance Matrix for Within-Module Co-expression on LOG SCALE ---
+# This matrix will define the linear correlation structure between genes on the log scale.
+# Genes within the same module will be linearly correlated; genes in different modules will not.
+# The cubic term will add an additional, non-linear correlation on top of this.
+
+# Controls the base variance of each gene on the log scale
+log_gene_variance <- 0.3 # Reduced to avoid excessively wide tails after exponentiation
+
+# Controls the linear correlation strength within a module (0 to 1) on the log scale
+within_module_correlation <- 0.5
+
+# Initialize a diagonal covariance matrix (genes are initially independent)
+covariance_matrix <- diag(num_genes) * log_gene_variance
+colnames(covariance_matrix) <- gene_ids
+rownames(covariance_matrix) <- gene_ids
+
+# Populate the covariance matrix for within-module linear co-expression
+for (i in 1:num_genes) {
+    for (j in i:num_genes) { # Iterate through upper triangle (matrix is symmetric)
+        if (i == j) {
+            # Diagonal elements are variances (already set)
+            next
+        }
+        
+        gene1_module <- gene_module_membership$Module[gene_module_membership$Gene == gene_ids[i]]
+        gene2_module <- gene_module_membership$Module[gene_module_membership$Gene == gene_ids[j]]
+        
+        if (gene1_module == gene2_module) {
+            # If genes are in the same module, set their covariance based on linear correlation
+            # Cov(X,Y) = Corr(X,Y) * SD(X) * SD(Y)
+            # Assuming SD(X) = SD(Y) = sqrt(log_gene_variance)
+            covariance_value <- within_module_correlation * log_gene_variance
+            covariance_matrix[i, j] <- covariance_value
+            covariance_matrix[j, i] <- covariance_value # Symmetric
+        }
+    }
+}
+
+cat("--- Sample of Covariance Matrix (first 5x5 block, on log scale) ---\n")
+print(round(covariance_matrix[1:5, 1:5], 2))
+cat(paste0(rep("-", 50), collapse = ""), "\n\n")
+
+
+# --- 5. Define Mean Expression Profiles for Healthy and Diseased (Module-aware, on LOG SCALE) ---
+mean_profile_Healthy_log <- rep(log_baseline_mean, num_genes)
+mean_profile_Diseased_log <- rep(log_baseline_mean, num_genes)
+
+for (i in 1:num_genes) {
+    gene_id <- gene_ids[i]
+    module_id_str <- gene_module_membership$Module[gene_module_membership$Gene == gene_id]
+    module_num <- as.numeric(strsplit(module_id_str, "_")[[1]][2])
+
+    # Differential expression strategy:
+    # Modules 1 to (num_modules/2) will have higher expression in Condition Healthy
+    # Modules (num_modules/2 + 1) to num_modules will have higher expression in Condition Diseased
+    if (module_num <= num_modules / 2) {
+        mean_profile_Healthy_log[i] <- mean_profile_Healthy_log[i] + log_module_effect_magnitude
+    } else {
+        mean_profile_Diseased_log[i] <- mean_profile_Diseased_log[i] + log_module_effect_magnitude
+    }
+}
+
+cat("--- Sample of Mean Expression Profiles (first 10 genes, on log scale) ---\n")
+print(data.frame(Gene = gene_ids[1:10], Mean_Healthy_log = mean_profile_Healthy_log[1:10], Mean_Diseased_log = mean_profile_Diseased_log[1:10]))
+cat(paste0(rep("-", 50), collapse = ""), "\n\n")
+
+
+# --- 6. Generate Synthetic Gene Expression Data (from Log-Normal Distribution with Cubic Term) ---
+
+# Generate module-specific latent variables for cubic effect
+# These will be shared by all genes within a module for a given sample, and are independent of mvrnorm noise
+module_latent_vars_healthy <- matrix(rnorm(num_modules * samples_per_condition),
+                                     nrow = num_modules,
+                                     ncol = samples_per_condition)
+module_latent_vars_diseased <- matrix(rnorm(num_modules * samples_per_condition),
+                                      nrow = num_modules,
+                                      ncol = samples_per_condition)
+
+
+# Generate base data for Healthy samples (linearly correlated on log-scale)
+expression_Healthy_log_base <- t(MASS::mvrnorm(n = samples_per_condition,
+                                               mu = mean_profile_Healthy_log,
+                                               Sigma = covariance_matrix))
+
+# Add the cubic term to introduce non-linear correlation within modules
+expression_Healthy_log <- expression_Healthy_log_base
+for (s in 1:samples_per_condition) {
+    for (g_idx in 1:num_genes) {
+        module_num <- as.numeric(strsplit(gene_module_membership$Module[g_idx], "_")[[1]][2])
+        # Add the scaled cubic term
+        cubic_term <- nonlinear_correlation_strength * (module_latent_vars_healthy[module_num, s])^3
+        expression_Healthy_log[g_idx, s] <- expression_Healthy_log[g_idx, s] + cubic_term
+    }
+}
+expression_Healthy <- exp(expression_Healthy_log) # Convert from log to linear scale
+colnames(expression_Healthy) <- paste0("Healthy_Sample_", 1:samples_per_condition)
+rownames(expression_Healthy) <- paste0("Gene_", 1:num_genes)
+
+
+# Generate base data for Diseased samples (linearly correlated on log-scale)
+expression_Diseased_log_base <- t(MASS::mvrnorm(n = samples_per_condition,
+                                                mu = mean_profile_Diseased_log,
+                                                Sigma = covariance_matrix))
+
+# Add the cubic term to introduce non-linear correlation within modules
+expression_Diseased_log <- expression_Diseased_log_base
+for (s in 1:samples_per_condition) {
+    for (g_idx in 1:num_genes) {
+        module_num <- as.numeric(strsplit(gene_module_membership$Module[g_idx], "_")[[1]][2])
+        # Add the scaled cubic term
+        cubic_term <- nonlinear_correlation_strength * (module_latent_vars_diseased[module_num, s])^3
+        expression_Diseased_log[g_idx, s] <- expression_Diseased_log[g_idx, s] + cubic_term
+    }
+}
+expression_Diseased <- exp(expression_Diseased_log) # Convert from log to linear scale
+colnames(expression_Diseased) <- paste0("Diseased_Sample_", 1:samples_per_condition)
+rownames(expression_Diseased) <- paste0("Gene_", 1:num_genes)
+
+# Ensure all expression values are non-negative (clip at a small value to avoid exact zero)
+expression_Healthy[expression_Healthy < 0.01] <- 0.01
+expression_Diseased[expression_Diseased < 0.01] <- 0.01
+
+
+# Combine into a single gene expression matrix
+synthetic_expression_data <- cbind(expression_Healthy, expression_Diseased)
+
+
+# --- 7. Create Sample Metadata (Phenotype/Condition Labels) ---
+sample_metadata <- data.frame(
+  Sample_ID = colnames(synthetic_expression_data),
+  Condition = c(rep("Healthy", samples_per_condition), rep("Diseased", samples_per_condition))
+)
+rownames(sample_metadata) <- sample_metadata$Sample_ID
+
+print("--- Synthetic Dataset Created ---")
+print(paste("Dimensions of expression data (genes x samples):",
+            dim(synthetic_expression_data)[1], "x", dim(synthetic_expression_data)[2]))
+print("First 5 rows and 5 columns of expression data (linear scale):")
+print(head(synthetic_expression_data[, 1:5]))
+print("First 5 rows of sample metadata:")
+print(head(sample_metadata))
+cat(paste0(rep("-", 50), collapse = ""), "\n\n")
+
+# --- Save synthetic_expression_data, sample_metadata, and gene_module_membership ---
+# Construct filenames to include module_effect_magnitude
+expression_filename <- paste0("synthetic_expression_data_effect_", log_module_effect_magnitude, ".csv")
+metadata_filename <- paste0("sample_metadata_effect_", log_module_effect_magnitude, ".csv")
+module_membership_filename <- paste0("gene_module_membership_effect_", log_module_effect_magnitude, ".csv")
+
+
+write.csv(synthetic_expression_data, expression_filename, row.names = TRUE)
+cat(sprintf("Saved %s\n", expression_filename))
+write.csv(sample_metadata, metadata_filename, row.names = FALSE)
+cat(sprintf("Saved %s\n", metadata_filename))
+write.csv(gene_module_membership, module_membership_filename, row.names = FALSE)
+cat(sprintf("Saved %s\n\n", module_membership_filename))
+
+
+# --- 8. Verify Overlap with PCA Plot ---
+
+# Transpose the expression data for PCA (PCA expects samples as rows, genes as columns)
+pca_input_data <- t(synthetic_expression_data)
+
+# Perform PCA
+pca_results <- prcomp(pca_input_data, center = TRUE, scale. = TRUE) # Scale is usually good for gene expression PCA
+
+# Extract PCA scores (coordinates of samples in PCA space)
+pca_scores <- as.data.frame(pca_results$x)
+
+# Add condition labels to the PCA scores
+pca_scores$Condition <- sample_metadata[rownames(pca_scores), "Condition"]
+
+# Calculate explained variance for PC1 and PC2
+pca_summary <- summary(pca_results)
+pc1_var_explained <- round(pca_summary$importance[2, 1] * 100, 2)
+pc2_var_explained <- round(pca_summary$importance[2, 2] * 100, 2)
+
+# --- Function to generate closed ellipse points for overlap calculation ---
+ellipse_points <- function(df, level = 0.95, n = 100) {
+  # For confidence ellipses, the scaling factor from stats::ellipse is chisq(level)/2
+  # For normal distribution, it's sqrt(qchisq(level, df = 2))
+  # The stat_ellipse uses a t-distribution by default, or normal if type="norm"
+  # Here we use the standard deviation for scaling to match a specific confidence region
+  
+  # Calculate 95% confidence region scaling factor from a chi-squared distribution with 2 degrees of freedom
+  # (since we are in 2D for PC1 and PC2)
+  scale_factor <- sqrt(qchisq(level, df = 2))
+  
+  cov_mat <- cov(df[, c("PC1", "PC2")])
+  mean_vals <- colMeans(df[, c("PC1", "PC2")])
+  
+  angles <- seq(0, 2 * pi, length.out = n)
+  
+  # Scale by the square root of the eigenvalues and rotate by eigenvectors (cholesky decomposition)
+  ellipse_coords <- t(chol(cov_mat)) %*% rbind(cos(angles), sin(angles))
+  
+  coords <- data.frame(
+    PC1 = mean_vals[1] + scale_factor * ellipse_coords[1,],
+    PC2 = mean_vals[2] + scale_factor * ellipse_coords[2,]
+  )
+  
+  # Close the polygon by adding the first point at the end
+  coords <- rbind(coords, coords[1,])
+  return(coords)
+}
+
+# --- Compute Overlap of Ellipses ---
+# Use the pca_scores as the pca_df mentioned in the user's snippet
+pca_df_for_overlap <- pca_scores
+
+# Generate closed ellipse points for each condition
+ellipse_healthy <- ellipse_points(pca_df_for_overlap %>% filter(Condition == "Healthy"))
+ellipse_diseased <- ellipse_points(pca_df_for_overlap %>% filter(Condition == "Diseased"))
+
+# Convert to sf polygons
+# Need to set a CRS, 4326 is WGS84, common for geographic coords, but can be arbitrary for abstract space
+poly_healthy <- st_polygon(list(as.matrix(ellipse_healthy)))
+poly_diseased <- st_polygon(list(as.matrix(ellipse_diseased)))
+
+# Set CRS to ensure st_intersection works (can be any valid CRS for arbitrary coordinates)
+poly_healthy_sfc <- st_sfc(poly_healthy, crs = 4326)
+poly_diseased_sfc <- st_sfc(poly_diseased, crs = 4326)
+
+# Compute overlap area
+intersection_geometry <- st_intersection(poly_healthy_sfc, poly_diseased_sfc)
+# Convert sf::units to numeric before operations
+intersect_area <- as.numeric(st_area(intersection_geometry))
+
+# Calculate total area for normalization
+area_healthy <- as.numeric(st_area(poly_healthy_sfc))
+area_diseased <- as.numeric(st_area(poly_diseased_sfc))
+
+# "Total area" for overlap percentage usually means the area of the smaller ellipse
+# or the sum of both areas. User specified min(area_healthy, area_diseased).
+total_area_for_overlap_calc <- min(area_healthy, area_diseased)
+
+
+overlap_value <- if (isTRUE(!is.na(intersect_area) && total_area_for_overlap_calc > 0)) {(intersect_area / total_area_for_overlap_calc) * 100
+} else { 0 }
+
+# Ensure overlap_value is not NaN if there's no intersection
+if (is.nan(overlap_value)) {
+  overlap_value <- 0
+}
+
+
+# --- Plot PCA1 vs PCA2 with customized theme and overlap annotation ---
+cat("\n--- Generating PCA Plot ---\n")
+pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = Condition, fill = Condition)) +
+  geom_point(size = 3, alpha = 0.8) + # Scatter points # Create and fill ellipses
+  stat_ellipse(geom = "polygon", alpha = 0.2, linetype = "solid", level = 0.95) +
+  labs(
+    title = paste0("Synthetic Gene Expression Data (Effect: ", log_module_effect_magnitude, ")"),
+    x = paste0("PC1 (", pc1_var_explained, "%)"),
+    y = paste0("PC2 (", pc2_var_explained, "%)")
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),# Remove gridlines
+    axis.line = element_line(color = "black"), # Add axis lines
+    axis.title = element_text(size = 14, face = "bold"), # Increase font size of axis labels
+    axis.text = element_text(size = 12), # Increase tick label size
+    plot.title = element_text(hjust = 0.5), # Center title
+    legend.position = "bottom"
+    )
+
+# Get plot limits after defining the plot object 'pca_plot'
+# This is crucial for correctly positioning the annotation
+plot_limits <- ggplot_build(pca_plot)$layout$panel_params[[1]]
+xmin <- plot_limits$x.range[1]
+ymin <- plot_limits$y.range[1]
+
+# Add annotation at lower-left
+final_pca_plot <- pca_plot +
+  annotate("text", x = xmin + 0.05 * (plot_limits$x.range[2] - xmin),
+           y = ymin + 0.05 * (plot_limits$y.range[2] - ymin),
+           label = sprintf("Overlap = %.2f%%", overlap_value),
+           size = 5, hjust = 0, vjust = 0, color = "black")
+
+print(final_pca_plot)
+
+# --- Save PCA Plot ---
+pca_plot_filename <- paste0("pca_plot_effect_", log_module_effect_magnitude, ".png")
+ggsave(pca_plot_filename, plot = final_pca_plot, width = 8, height = 6, dpi = 300, bg = "white")
+cat(sprintf("Saved %s\n\n", pca_plot_filename))
+
+
+# To see how much variance is explained by the first few PCs:
+print("Variance explained by PCs:")
+print(summary(pca_results))
+cat(paste0(rep("-", 50), collapse = ""), "\n\n")
+
+
+# --- 9. Compute Overlap Percentage (Estimated using Logistic Regression) ---
+# This is a separate estimation of overlap from the geometric one.
+
+cat("\n--- Computing Overlap Percentage (Estimated via Logistic Regression) ---\n")
+
+# Ensure 'Condition' is a factor for classification
+pca_scores$Condition <- factor(pca_scores$Condition)
+
+# Train a logistic regression model
+logistic_model <- glm(Condition ~ PC1 + PC2, data = pca_scores, family = "binomial")
+
+# Predict probabilities
+probabilities <- predict(logistic_model, type = "response")
+
+# Convert probabilities to class predictions
+# The levels should match 'Healthy' and 'Diseased'
+predicted_classes_lr <- factor(ifelse(probabilities > 0.5, "Diseased", "Healthy"), levels = levels(pca_scores$Condition))
+
+# Calculate misclassification rate
+misclassification_rate_lr <- mean(predicted_classes_lr != pca_scores$Condition)
+overlap_percentage_lr <- round(misclassification_rate_lr * 100, 2)
+
+cat(sprintf("Estimated Overlap Percentage (Logistic Regression misclassification): %.2f%%\n", overlap_percentage_lr))
+cat(paste0(rep("=", 50), collapse = ""), "\n")
+
+
+```
+
+```{r}
+png(paste0("histogram_", log_module_effect_magnitude, ".png"), width = 6, height = 5, units = "in", res = 600)
+hist(rowSums(synthetic_expression_data), col="red", xlab = "Edge Strength")
+dev.off()
+```
+
+# B.0 Data preprocessing
+
+```{r}
+#renv::install('tibble')
+library(tibble)
+library(Biobase)
+library(annotate)
+
+phenData = AnnotatedDataFrame(
+  read.csv(paste0("sample_metadata_effect_",variability,".csv"), header=T, row.names = 1)
+)
+```
+
+```{r}
+eSet = new("ExpressionSet",
+           exprs= as.matrix(synthetic_expression_data),
+           phenoData = phenData
+           )
+eSet
+summary(exprs(eSet))[,1:5]
+```
+
+```{r}
+#renv::install('limma')
+library(limma)
+
+normData = normalizeBetweenArrays(exprs(eSet))
+eSet.norm = new("ExpressionSet",
+           exprs= as.matrix(normData),
+           phenoData = phenData)
+boxplot(exprs(eSet.norm)[,1:10])
+summary(exprs(eSet.norm))[,1:5]
+```
+
+```{r}
+library(WGCNA)
+dat.matrix = exprs(eSet.norm)
+dat.expr = as.data.frame(t(dat.matrix))
+
+gsg = goodSamplesGenes(dat.expr, verbose = 3)
+
+if(sum(!gsg$goodSamples)>0) {
+  summary(exprs(eSet.norm.combat))[,!gsg$goodSamples]
+}
+sprintf("There are %d bad samples in the dataset.", sum(!gsg$goodSamples))
+
+if(sum(!gsg$goodGenes)) {
+  bad.genes.list = colnames(dat.expr)[!gsg$goodGenes]
+}
+sprintf('There are %d bad genes in the dataset.', sum(!gsg$goodGenes))
+```
+
+```{r}
+sampleTree = hclust(dist(dat.expr), method = "average")
+plot(sampleTree, 
+     main = "Tree cluster for outlier detection", sub="", xlab="", 
+     cex.lab = 1.5, cex.axis = 1.5, cex.main = 2,
+     )
+h=25
+clust = cutreeStatic(sampleTree, cutHeight = h, minSize = 10)
+table(clust)
+```
+
+# B. WGCNA Method
+
+```{r}
+library(WGCNA)
+options(stringsAsFactors = FALSE)
+disableWGCNAThreads()
+```
+
+```{r}
+ggset = as.data.frame(t(exprs(eSet.norm)))
+head(ggset)
+```
+
+```{r}
+softPower = 1
+adj = adjacency(ggset, power = softPower)
+dim(adj)
+TOM = TOMsimilarity(adj);
+dissTOM = 1-TOM
+dim(TOM)
+
+# Call the hierarchical clustering function
+geneTree = hclust(as.dist(dissTOM), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", 
+     main = "Gene clustering of Synthetic Dataset",
+     labels = FALSE, hang = 0.04)
+```
+
+```{r}
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 10;
+
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+table(dynamicMods)
+
+# Convert numeric lables into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05,
+main = "Gene dendrogram of Synthetic Dataset")
+```
+
+```{r}
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(dynamicColors, colorOrder)-1;
+table(dynamicColors)
+table(dynamicMods)
+
+# Create a dataframe
+df <- data.frame(
+  genes = colnames(ggset),
+  modules = dynamicColors
+)
+# Save the dataframe to a CSV file
+output_file <- paste0("moduleColors_WGCNA_",variability,".csv")
+write.csv(df, file = output_file, row.names = F)
+dim(df)
+```
+
+```{r}
+datTraits = pData(phenData)
+datTraits$Condition <- ifelse(datTraits$Condition == "Healthy", 0, 1)
+datTraits
+
+```
+
+```{r}
+library(ggplot2)
+
+datExpr = ggset
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+datTraits = pData(eSet.norm)
+datTraits$Condition <- ifelse(datTraits$Condition == "Healthy", 0, 1)
+
+MEs0 = moduleEigengenes(datExpr, dynamicColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = cor(MEs, datTraits, use = "p")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+
+
+# Will display correlations and their p-values
+png(paste0("WGCNAModules_Synthetic_", variability, ".png"),width=7,height=5,units="in",res=600)
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                    signif(moduleTraitPvalue, 1), ")", sep = "");
+                    dim(textMatrix) = dim(moduleTraitCor)
+                    par(mar = c(6, 10, 3, 3))
+par(mar = c(8, 8, 2, 1))  # Reduce margins (bottom, left, top, right)
+labeledHeatmap(Matrix = moduleTraitCor,
+              xLabels = names(datTraits),
+              yLabels = names(MEs),
+              ySymbols = names(MEs),
+              colorLabels = FALSE,
+              colors = blueWhiteRed(50),
+              textMatrix = textMatrix,
+              setStdMargins = FALSE,
+              cex.text = 0.3,
+              zlim = c(-1,1),
+              main = paste("Diseased vs Healthy"))
+```
+
+# C. Our Method
+
+```{r}
+healthy.exprs = exprs(eSet.norm)[,1:50]
+write.table(healthy.exprs,file = paste0("synthetic_healthy_", log_module_effect_magnitude,".txt"), sep = "\t", 
+              quote = FALSE, row.names = TRUE, col.names = TRUE)
+
+diseased.exprs = exprs(eSet.norm)[,51:100]
+write.table(diseased.exprs, file = paste0("synthetic_diseased_", log_module_effect_magnitude,".txt"), sep = "\t", 
+              quote = FALSE, row.names = TRUE, col.names = TRUE)
+dim(healthy.exprs)
+dim(diseased.exprs)
+```
+
+## C.1 Low variability (p = 0.1)
+
+```{r}
+healthy.dcor = read.csv("dcor-method/dcor_synthetic_healthy_0.1.csv", header=T)
+healthy.dcor = as.matrix(healthy.dcor[,-c(1)])
+dim(healthy.dcor)
+```
+
+```{r}
+TOM.healthy.dcor = TOMsimilarity(as.matrix(healthy.dcor));
+dissTOM.healthy.dcor = 1-TOM.healthy.dcor
+dim(TOM.healthy.dcor)
+```
+
+```{r}
+hist(rowSums(TOM.healthy.dcor))
+write.table(dissTOM.healthy.dcor, file = "dcor-method/dissTOM_healthy_dcor9_0.1.txt", row.names = FALSE, col.names = FALSE, sep = " ")
+```
+
+```{r}
+# Call the hierarchical clustering function
+geneTree = hclust(as.dist(dissTOM.healthy.dcor), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", 
+     main = "Gene clustering of Healthy Samples based on TOM-based dissimilarity",
+     labels = FALSE)
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 10;
+
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM.healthy.dcor,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+table(dynamicMods)
+
+# Convert numeric lables into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05,
+main = "Gene dendrogram of HealthySamples")
+```
+
+```{r}
+healthy.ggset = read.table(paste0("dcor-method/","synthetic_healthy_0.1.txt"), header = TRUE, sep="\t")
+rownames(healthy.ggset) = healthy.ggset$Genes
+healthy.ggset = as.data.frame(t(healthy.ggset[,-1]))
+healthy.ggset = healthy.ggset[,colnames(healthy.dcor)]
+head(healthy.ggset)
+
+# Calculate eigengenes
+MEList = moduleEigengenes(as.matrix(healthy.ggset), colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average");
+# Plot the result
+sizeGrWindow(16, 8)
+plot(METree, main = "Clustering of module eigengenes in Healthy Samples",
+xlab = "", sub = "")
+# Merging modules
+MEDissThres = 0.2
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+
+
+# Rename to moduleColors
+moduleColors = dynamicColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+dim(MEs)
+
+freq.tab <- as.data.frame(table(moduleColors))
+
+colnames(freq.tab) <- c("Modules", "Membership")
+freq.tab = freq.tab[order(-freq.tab$Membership), ]
+rownames(freq.tab) <- 1:nrow(freq.tab)
+freq.tab$Modules = factor(freq.tab$Modules, levels = freq.tab$Modules)
+
+ggplot(freq.tab, aes(x = Modules, y = Membership, fill = Modules)) +
+  geom_bar(stat = "identity",  color = "grey1", size = 0.5) +
+  labs(title = "Module Size in Healthy Patients",
+       x = "Modules",
+       y = "Membership") +
+  scale_fill_manual(values=as.character(freq.tab$Modules)) + # Set bar colors
+  theme_minimal() + 
+  theme(
+    panel.grid = element_blank(),        # Remove grid lines
+    axis.line = element_line(size = 0.5),  # Adjust line width of axes
+    axis.text.x = element_text(size = 10, color='black', angle = 90), # Adjust font size of axis text
+    axis.text.y = element_text(size = 10, color='black'),
+    axis.title = element_text(size = 16) # Adjust font size of axis labels
+  ) +
+  theme(legend.position = "none")  # Remove legend if unnecessary
+```
+
+```{r}
+# Function to extract genes belonging to each module
+genelist = names(healthy.ggset)
+get_module_genes <- function(genelist, moduleColors) {
+  unique_colors <- unique(moduleColors) # Get unique module names
+  module_genes <- lapply(unique_colors, function(color) {
+    which(moduleColors == color) # Indices of genes in this module
+  })
+  names(module_genes) <- unique_colors
+  # Map indices back to gene names
+  module_genes <- lapply(module_genes, function(indices) genelist[indices])
+  return(module_genes)
+}
+
+healthy_modules <- get_module_genes(colnames(healthy.dcor), moduleColors)
+
+# Create a dataframe
+df <- data.frame(
+  genes = colnames(healthy.dcor),
+  modules = moduleColors
+)
+# Save the dataframe to a CSV file
+output_file <- paste0("dcor-method/","modules_healthy_0.1.csv")
+write.csv(df, file = output_file, row.names = F)
+length(df$genes)
+unique(df$modules)
+head(df)
+```
+
+```{r}
+diseased.dcor = read.csv("dcor-method/dcor_synthetic_diseased_0.1.csv", header=T)
+diseased.dcor = as.matrix(diseased.dcor[,-c(1)])
+dim(diseased.dcor)
+```
+
+```{r}
+TOM.diseased.dcor = TOMsimilarity(as.matrix(diseased.dcor));
+dissTOM.diseased.dcor = 1-TOM.diseased.dcor
+dim(TOM.diseased.dcor)
+```
+
+```{r}
+hist(rowSums(TOM.diseased.dcor))
+write.table(dissTOM.diseased.dcor, file = "dcor-method/dissTOM_diseased_dcor9_0.1.txt", row.names = FALSE, col.names = FALSE, sep = " ")
+```
+
+```{r}
+# Call the hierarchical clustering function
+geneTree2 = hclust(as.dist(dissTOM.diseased.dcor), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree2, xlab="", sub="", 
+     main = "Gene clustering of Healthy Samples based on TOM-based dissimilarity",
+     labels = FALSE)
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 10;
+
+# Module identification using dynamic tree cut:
+dynamicMods2 = cutreeDynamic(dendro = geneTree2, distM = dissTOM.diseased.dcor,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+table(dynamicMods2)
+
+# Convert numeric lables into colors
+dynamicColors2 = labels2colors(dynamicMods2)
+table(dynamicColors2)
+
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree2, dynamicColors2, "Dynamic Tree Cut",
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05,
+main = "Gene dendrogram of Diseased Samples")
+```
+
+```{r}
+diseased.ggset = read.table(paste0("dcor-method/","synthetic_diseased_0.1.txt"), header = TRUE, sep="\t")
+rownames(diseased.ggset) = diseased.ggset$Genes
+diseased.ggset = as.data.frame(t(diseased.ggset[,-1]))
+diseased.ggset = diseased.ggset[,colnames(diseased.dcor)]
+head(diseased.ggset)
+
+# Calculate eigengenes
+MEList2 = moduleEigengenes(as.matrix(diseased.ggset), colors = dynamicColors2)
+MEs2 = MEList2$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss2 = 1-cor(MEs2);
+# Cluster module eigengenes
+METree2 = hclust(as.dist(MEDiss2), method = "average");
+# Plot the result
+sizeGrWindow(16, 8)
+plot(METree2, main = "Clustering of module eigengenes in Healthy Samples",
+xlab = "", sub = "")
+# Merging modules
+MEDissThres = 0.2
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+
+
+# Rename to moduleColors
+moduleColors2 = dynamicColors2
+# Construct numerical labels corresponding to the colors
+colorOrder2 = c("grey", standardColors(50));
+moduleLabels2 = match(moduleColors2, colorOrder2)-1;
+dim(MEs2)
+
+freq.tab <- as.data.frame(table(moduleColors2))
+
+colnames(freq.tab) <- c("Modules", "Membership")
+freq.tab = freq.tab[order(-freq.tab$Membership), ]
+rownames(freq.tab) <- 1:nrow(freq.tab)
+freq.tab$Modules = factor(freq.tab$Modules, levels = freq.tab$Modules)
+
+ggplot(freq.tab, aes(x = Modules, y = Membership, fill = Modules)) +
+  geom_bar(stat = "identity",  color = "grey1", size = 0.5) +
+  labs(title = "Module Size in Healthy Patients",
+       x = "Modules",
+       y = "Membership") +
+  scale_fill_manual(values=as.character(freq.tab$Modules)) + # Set bar colors
+  theme_minimal() + 
+  theme(
+    panel.grid = element_blank(),        # Remove grid lines
+    axis.line = element_line(size = 0.5),  # Adjust line width of axes
+    axis.text.x = element_text(size = 10, color='black', angle = 90), # Adjust font size of axis text
+    axis.text.y = element_text(size = 10, color='black'),
+    axis.title = element_text(size = 16) # Adjust font size of axis labels
+  ) +
+  theme(legend.position = "none")  # Remove legend if unnecessary
+```
+
+```{r}
+# Function to extract genes belonging to each module
+genelist2 = names(diseased.ggset)
+get_module_genes <- function(genelist, moduleColors) {
+  unique_colors <- unique(moduleColors) # Get unique module names
+  module_genes <- lapply(unique_colors, function(color) {
+    which(moduleColors == color) # Indices of genes in this module
+  })
+  names(module_genes) <- unique_colors
+  # Map indices back to gene names
+  module_genes <- lapply(module_genes, function(indices) genelist[indices])
+  return(module_genes)
+}
+
+diseased_modules <- get_module_genes(colnames(diseased.dcor), moduleColors2)
+
+# Create a dataframe
+df <- data.frame(
+  genes = colnames(diseased.dcor),
+  modules = moduleColors2
+)
+# Save the dataframe to a CSV file
+output_file <- paste0("dcor-method/","modules_diseased_0.1.csv")
+write.csv(df, file = output_file, row.names = F)
+length(df$genes)
+unique(df$modules)
+head(df)
+```
+
+## C.2 High variability (p=0.9)
+
+```{r}
+healthy.dcor = read.csv("dcor-method/dcor_synthetic_healthy_0.9.csv", header=T)
+healthy.dcor = as.matrix(healthy.dcor[,-c(1)])
+dim(healthy.dcor)
+```
+
+```{r}
+hist(rowSums(as.matrix(healthy.dcor)))
+adj = adjacency.fromSimilarity(as.matrix(healthy.dcor), power=1)
+hist(rowSums(adj))
+```
+
+```{r}
+TOM.healthy.dcor = TOMsimilarity(adj);
+dissTOM.healthy.dcor = 1-TOM.healthy.dcor
+dim(TOM.healthy.dcor)
+```
+
+```{r}
+hist(rowSums(TOM.healthy.dcor))
+write.table(dissTOM.healthy.dcor, file = "dcor-method/dissTOM_healthy_dcor9_0.9.txt", row.names = FALSE, col.names = FALSE, sep = " ")
+```
+
+```{r}
+# Call the hierarchical clustering function
+geneTree = hclust(as.dist(dissTOM.healthy.dcor), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", 
+     main = "Gene clustering of Healthy Samples based on TOM-based dissimilarity",
+     labels = FALSE)
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 10;
+
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM.healthy.dcor,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+table(dynamicMods)
+
+# Convert numeric lables into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05,
+main = "Gene dendrogram of HealthySamples")
+```
+
+```{r}
+healthy.ggset = read.table(paste0("dcor-method/","synthetic_healthy_0.9.txt"), header = TRUE, sep="\t")
+rownames(healthy.ggset) = healthy.ggset$Genes
+healthy.ggset = as.data.frame(t(healthy.ggset[,-1]))
+healthy.ggset = healthy.ggset[,colnames(healthy.dcor)]
+head(healthy.ggset)
+
+# Calculate eigengenes
+MEList = moduleEigengenes(as.matrix(healthy.ggset), colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average");
+# Plot the result
+sizeGrWindow(16, 8)
+plot(METree, main = "Clustering of module eigengenes in Healthy Samples",
+xlab = "", sub = "")
+# Merging modules
+MEDissThres = 0.2
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+
+
+# Rename to moduleColors
+moduleColors = dynamicColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+dim(MEs)
+
+freq.tab <- as.data.frame(table(moduleColors))
+
+colnames(freq.tab) <- c("Modules", "Membership")
+freq.tab = freq.tab[order(-freq.tab$Membership), ]
+rownames(freq.tab) <- 1:nrow(freq.tab)
+freq.tab$Modules = factor(freq.tab$Modules, levels = freq.tab$Modules)
+
+ggplot(freq.tab, aes(x = Modules, y = Membership, fill = Modules)) +
+  geom_bar(stat = "identity",  color = "grey1", size = 0.5) +
+  labs(title = "Module Size in Healthy Patients",
+       x = "Modules",
+       y = "Membership") +
+  scale_fill_manual(values=as.character(freq.tab$Modules)) + # Set bar colors
+  theme_minimal() + 
+  theme(
+    panel.grid = element_blank(),        # Remove grid lines
+    axis.line = element_line(size = 0.5),  # Adjust line width of axes
+    axis.text.x = element_text(size = 10, color='black', angle = 90), # Adjust font size of axis text
+    axis.text.y = element_text(size = 10, color='black'),
+    axis.title = element_text(size = 16) # Adjust font size of axis labels
+  ) +
+  theme(legend.position = "none")  # Remove legend if unnecessary
+```
+
+```{r}
+# Function to extract genes belonging to each module
+genelist = names(healthy.ggset)
+get_module_genes <- function(genelist, moduleColors) {
+  unique_colors <- unique(moduleColors) # Get unique module names
+  module_genes <- lapply(unique_colors, function(color) {
+    which(moduleColors == color) # Indices of genes in this module
+  })
+  names(module_genes) <- unique_colors
+  # Map indices back to gene names
+  module_genes <- lapply(module_genes, function(indices) genelist[indices])
+  return(module_genes)
+}
+
+healthy_modules <- get_module_genes(colnames(healthy.dcor), moduleColors)
+
+# Create a dataframe
+df <- data.frame(
+  genes = colnames(healthy.dcor),
+  modules = moduleColors
+)
+# Save the dataframe to a CSV file
+output_file <- paste0("dcor-method/","modules_healthy_0.9.csv")
+write.csv(df, file = output_file, row.names = F)
+length(df$genes)
+unique(df$modules)
+head(df)
+```
+
+```{r}
+diseased.dcor = read.csv("dcor-method/dcor_synthetic_diseased_0.9.csv", header=T)
+diseased.dcor = as.matrix(diseased.dcor[,-c(1)])
+dim(diseased.dcor)
+```
+
+```{r}
+hist(rowSums(as.matrix(diseased.dcor)))
+adj = adjacency.fromSimilarity(as.matrix(diseased.dcor), power=1)
+hist(rowSums(adj))
+```
+
+```{r}
+TOM.diseased.dcor = TOMsimilarity(adj);
+dissTOM.diseased.dcor = 1-TOM.diseased.dcor
+dim(TOM.diseased.dcor)
+```
+
+```{r}
+hist(rowSums(TOM.diseased.dcor))
+write.table(dissTOM.diseased.dcor, file = "dcor-method/dissTOM_diseased_dcor9_0.9.txt", row.names = FALSE, col.names = FALSE, sep = " ")
+```
+
+```{r}
+# Call the hierarchical clustering function
+geneTree2 = hclust(as.dist(dissTOM.diseased.dcor), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree2, xlab="", sub="", 
+     main = "Gene clustering of Healthy Samples based on TOM-based dissimilarity",
+     labels = FALSE)
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 10;
+
+# Module identification using dynamic tree cut:
+dynamicMods2 = cutreeDynamic(dendro = geneTree2, distM = dissTOM.diseased.dcor,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+table(dynamicMods2)
+
+# Convert numeric lables into colors
+dynamicColors2 = labels2colors(dynamicMods2)
+table(dynamicColors2)
+
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree2, dynamicColors2, "Dynamic Tree Cut",
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05,
+main = "Gene dendrogram of Diseased Samples")
+```
+
+```{r}
+diseased.ggset = read.table(paste0("dcor-method/","synthetic_diseased_0.9.txt"), header = TRUE, sep="\t")
+rownames(diseased.ggset) = diseased.ggset$Genes
+diseased.ggset = as.data.frame(t(diseased.ggset[,-1]))
+diseased.ggset = diseased.ggset[,colnames(diseased.dcor)]
+head(diseased.ggset)
+
+# Calculate eigengenes
+MEList2 = moduleEigengenes(as.matrix(diseased.ggset), colors = dynamicColors2)
+MEs2 = MEList2$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss2 = 1-cor(MEs2);
+# Cluster module eigengenes
+METree2 = hclust(as.dist(MEDiss2), method = "average");
+# Plot the result
+sizeGrWindow(16, 8)
+plot(METree2, main = "Clustering of module eigengenes in Healthy Samples",
+xlab = "", sub = "")
+# Merging modules
+MEDissThres = 0.2
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+
+
+# Rename to moduleColors
+moduleColors2 = dynamicColors2
+# Construct numerical labels corresponding to the colors
+colorOrder2 = c("grey", standardColors(50));
+moduleLabels2 = match(moduleColors2, colorOrder2)-1;
+dim(MEs2)
+
+freq.tab <- as.data.frame(table(moduleColors2))
+
+colnames(freq.tab) <- c("Modules", "Membership")
+freq.tab = freq.tab[order(-freq.tab$Membership), ]
+rownames(freq.tab) <- 1:nrow(freq.tab)
+freq.tab$Modules = factor(freq.tab$Modules, levels = freq.tab$Modules)
+
+ggplot(freq.tab, aes(x = Modules, y = Membership, fill = Modules)) +
+  geom_bar(stat = "identity",  color = "grey1", size = 0.5) +
+  labs(title = "Module Size in Healthy Patients",
+       x = "Modules",
+       y = "Membership") +
+  scale_fill_manual(values=as.character(freq.tab$Modules)) + # Set bar colors
+  theme_minimal() + 
+  theme(
+    panel.grid = element_blank(),        # Remove grid lines
+    axis.line = element_line(size = 0.5),  # Adjust line width of axes
+    axis.text.x = element_text(size = 10, color='black', angle = 90), # Adjust font size of axis text
+    axis.text.y = element_text(size = 10, color='black'),
+    axis.title = element_text(size = 16) # Adjust font size of axis labels
+  ) +
+  theme(legend.position = "none")  # Remove legend if unnecessary
+```
+
+## 
+
+# D. DGCA
+
+```{r}
+# renv::install("andymckenzie/DGCA")
+library(DGCA)
+```
+
+## D.1 Low variability (p=0.1)
+
+```{r}
+log_module_effect_magnitude = 0.1
+dgca_design <- data.frame(
+  Healthy = as.numeric(!datTraits$Condition),
+  Diseased = as.numeric(datTraits$Condition))
+rownames(dgca_design) <- rownames(datTraits)
+
+synthetic_expression_data = read.csv("synthetic_expression_data_effect_0.1.csv", header=T, row.names = "X")
+modules_list = read.csv("wgcna/moduleColors_WGCNA_0.1.csv", header=T)
+
+moduleDC_res <- moduleDC(inputMat = synthetic_expression_data,
+                      design = as.matrix(dgca_design),
+                      compare = c("Healthy","Diseased"), # Column name in dgca_design
+                      genes = modules_list$genes,
+                      labels = modules_list$modules,
+                      nPerms = 50,
+                      number_DC_genes = 10,
+                      dCorAvgMethod = "median")
+
+```
+
+```{r}
+moduleDC_res
+```
+
+```{r}
+
+# 1. Extract and prepare data
+module_raw_names <- moduleDC_res$Module # e.g., c("blue", "red", "green")
+module_meanDCs <- moduleDC_res$MeDC    # e.g., c(0.1, -0.2, 0.05)
+module_pVals <- moduleDC_res$pVal      # e.g., c(0.001, 0.05, 0.1)
+
+# 2. Create the desired module order with "ME" prefix
+module_order <- paste0("ME", module_raw_names) # This will be MEblue, MEred, MEgreen
+
+# 3. Create the heatmap matrix and assign meaningful row names
+dgca_heatmap_matrix <- as.matrix(module_meanDCs)
+# Assign the new module names as row names for the matrix.
+# This is crucial for labeledHeatmap to correctly associate labels with rows.
+rownames(dgca_heatmap_matrix) <- module_order
+colnames(dgca_heatmap_matrix) <- c("Mean Diff. Cor.") # This column name will be for xLabel
+
+# 4. Prepare text matrix for p-values and meanDCs
+dgca_textMatrix = paste(signif(dgca_heatmap_matrix, 2), "\n(",
+                        signif(module_pVals, 1), ")", sep = "");
+dim(dgca_textMatrix) = dim(dgca_heatmap_matrix) # Ensure dimensions are correctly set
+
+# Plotting
+cat("\n--- DGCA Pre-defined Module-level Differential Correlation Heatmap ---\n")
+sizeGrWindow(6, 8) # Adjust window size for plot
+
+# Define output file path and name
+output_png_file <- paste0("dcga/DGCA_Module_MeanDC_Heatmap_Effect_", log_module_effect_magnitude, ".png")
+
+# Ensure the 'dcga' directory exists. If not, create it.
+if (!dir.exists("dcga")) {
+  dir.create("dcga")
+}
+
+# # Open PNG device to save the plot
+# png(output_png_file, width = 600, height = 800, res=100, bg = "white")
+# 
+# # Adjust plot margins (bottom, left, top, right)
+# # Increase left margin to ensure enough space for longer module names
+# par(mar = c(6, 12, 3, 3))
+# 
+# labeledHeatmap(Matrix = dgca_heatmap_matrix,
+#                xLabels = "Condition",           # Overall label for the x-axis
+#                yLabels = module_order,        # Overall label for the y-axis
+#                ySymbols = rownames(dgca_heatmap_matrix), # Individual labels for each row (MEblue, MEred, etc.)
+#                colorLabels = FALSE,
+#                colors = blueWhiteRed(50),       # Color scale (from WGCNA)
+#                textMatrix = dgca_textMatrix,    # Text to display inside heatmap cells
+#                setStdMargins = FALSE,
+#                cex.text = 0.7,                  # Size of text INSIDE the cells (meanDC (p-val))
+#                cex.lab = 1,                     # Size of "Condition" and "Module Names" overall labels
+#                cex.rowLabels = 0.9,             # **CRITICAL**: Size of the individual row labels (ySymbols). Adjust as needed.
+#                zlim = c(-max(abs(dgca_heatmap_matrix)), max(abs(dgca_heatmap_matrix))), # Symmetric color scale
+#                main = paste("DGCA: Median Within-Module Diff")) # Main plot title
+# 
+
+
+# Plotting the heatmap using labeledHeatmap
+# Customize text matrix for correlation and p-value display
+dev.off()
+png(output_png_file,width=6,height=5,units="in",res=600)
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                    signif(moduleTraitPvalue, 1), ")", sep = "");
+                    dim(textMatrix) = dim(moduleTraitCor)
+                    par(mar = c(6, 10, 3, 3))
+par(mar = c(8, 8, 2, 1))  # Reduce margins (bottom, left, top, right)
+labeledHeatmap(Matrix = dgca_heatmap_matrix,
+               xLabels = "Condition",
+               yLabels = module_order,
+               ySymbols = rownames(dgca_heatmap_matrix),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50), # Red for positive, blue for negative correlation
+               textMatrix = dgca_textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.5, # Adjust text size
+               # zlim = c(-1, 1),
+               main = paste("DGCA")
+               )
+
+cat("\nModule-Trait Relationship Heatmap generated.\n")
+dev.off()
+cat(sprintf("Saved %s\n\n", output_png_file))
+```
+
+## D.2 High Variability (p=0.9)
+
+```{r}
+log_module_effect_magnitude = 0.9
+dgca_design <- data.frame(
+  Healthy = as.numeric(!datTraits$Condition),
+  Diseased = as.numeric(datTraits$Condition))
+rownames(dgca_design) <- rownames(datTraits)
+
+synthetic_expression_data = read.csv("synthetic_expression_data_effect_0.9.csv", header=T, row.names = "X")
+modules_list = read.csv("wgcna/moduleColors_WGCNA_0.9.csv", header=T)
+
+moduleDC_res <- moduleDC(inputMat = synthetic_expression_data,
+                      design = as.matrix(dgca_design),
+                      compare = c("Healthy","Diseased"), # Column name in dgca_design
+                      genes = modules_list$genes,
+                      labels = modules_list$modules,
+                      nPerms = 50,
+                      number_DC_genes = 10,
+                      dCorAvgMethod = "median")
+
+```
+
+```{r}
+moduleDC_res
+```
+
+```{r}
+# 1. Extract and prepare data
+module_raw_names <- moduleDC_res$Module # e.g., c("blue", "red", "green")
+module_meanDCs <- moduleDC_res$MeDC    # e.g., c(0.1, -0.2, 0.05)
+module_pVals <- moduleDC_res$pVal      # e.g., c(0.001, 0.05, 0.1)
+
+# 2. Create the desired module order with "ME" prefix
+module_order <- paste0("ME", module_raw_names) # This will be MEblue, MEred, MEgreen
+
+# 3. Create the heatmap matrix and assign meaningful row names
+dgca_heatmap_matrix <- as.matrix(module_meanDCs)
+# Assign the new module names as row names for the matrix.
+# This is crucial for labeledHeatmap to correctly associate labels with rows.
+rownames(dgca_heatmap_matrix) <- module_order
+colnames(dgca_heatmap_matrix) <- c("Mean Diff. Cor.") # This column name will be for xLabel
+
+# 4. Prepare text matrix for p-values and meanDCs
+dgca_textMatrix = paste(signif(dgca_heatmap_matrix, 2), "\n(",
+                        signif(module_pVals, 1), ")", sep = "");
+dim(dgca_textMatrix) = dim(dgca_heatmap_matrix) # Ensure dimensions are correctly set
+
+# Plotting
+cat("\n--- DGCA Pre-defined Module-level Differential Correlation Heatmap ---\n")
+sizeGrWindow(6, 8) # Adjust window size for plot
+
+# Define output file path and name
+output_png_file <- paste0("dcga/DGCA_Module_MeanDC_Heatmap_Effect_", log_module_effect_magnitude, ".png")
+
+# Ensure the 'dcga' directory exists. If not, create it.
+if (!dir.exists("dcga")) {
+  dir.create("dcga")
+}
+
+dev.off()
+png(output_png_file,width=6,height=5,units="in",res=600)
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                    signif(moduleTraitPvalue, 1), ")", sep = "");
+                    dim(textMatrix) = dim(moduleTraitCor)
+                    par(mar = c(6, 10, 3, 3))
+par(mar = c(8, 8, 2, 1))  # Reduce margins (bottom, left, top, right)
+labeledHeatmap(Matrix = dgca_heatmap_matrix,
+               xLabels = "Condition",
+               yLabels = module_order,
+               ySymbols = rownames(dgca_heatmap_matrix),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50), # Red for positive, blue for negative correlation
+               textMatrix = dgca_textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.5, # Adjust text size
+               # zlim = c(-1, 1),
+               main = paste("DGCA")
+               )
+
+cat("\nModule-Trait Relationship Heatmap generated.\n")
+dev.off()
+cat(sprintf("Saved %s\n\n", output_png_file))
+```
+
+# E. DiffCoExp
+
+```{r}
+# renv::install("diffcoexp")
+# renv::install("GEOquery")
+library(diffcoexp)
+allowWGCNAThreads()
+```
+
+## E.1 Low variability (p=0.1)
+
+```{r}
+exprs.h = read.csv("dcor-method/synthetic_healthy_0.1.txt", sep = "\t", header=T, row.names = "Genes")
+exprs.d = read.csv("dcor-method/synthetic_diseased_0.1.txt", sep = "\t", header=T, row.names = "Genes")
+allowWGCNAThreads()
+
+# Diseased - Healthy; high correlation --> diseased
+# Step 1
+res.low =diffcoexp(exprs.1 = exprs.d, exprs.2 = exprs.h,
+                   r.method = "pearson",q.method = "bonferroni")
+```
+
+```{r}
+library(WGCNA)
+# WGCNA often recommends setting this
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads() # Use multiple cores if available
+
+# --- Input Data ---
+# Read expression data for two conditions
+# Ensure 'row.names = "Genes"' correctly identifies the gene ID column
+exprs.1 = read.csv("dcor-method/synthetic_healthy_0.1.txt", sep = "\t", header=T, row.names = "Genes")
+exprs.2 = read.csv("dcor-method/synthetic_diseased_0.1.txt", sep = "\t", header=T, row.names = "Genes")
+
+# Ensure gene order is consistent across conditions
+commonGenes <- intersect(rownames(exprs.1), rownames(exprs.2))
+exprs.1 <- exprs.1[commonGenes, ]
+exprs.2 <- exprs.2[commonGenes, ]
+
+# IMPORTANT for WGCNA: Transpose data so samples are rows and genes are columns
+datExpr1 <- as.data.frame(t(exprs.1))
+datExpr2 <- as.data.frame(t(exprs.2))
+
+# Combine expression data for module eigengene calculation and trait mapping
+# The column names (genes) must be identical for cbind to work correctly
+datExpr_combined <- t(cbind(exprs.1, exprs.2))
+
+cat("Data dimensions for WGCNA (samples x genes):\n")
+cat("Condition 1:", dim(datExpr1), "\n")
+cat("Condition 2:", dim(datExpr2), "\n")
+cat("Combined data:", dim(datExpr_combined), "\n\n")
+
+# --- Define Soft-thresholding Power (beta) ---
+# As per the paper, beta is a tuning parameter for the adjacency difference matrix.
+# Its choice impacts the stringency of differential correlation.
+beta = 1 # Example value, adjust as needed based on your data and desired stringency
+
+
+# ==============================================================================
+# DiffCoEx Algorithm Steps
+# ==============================================================================
+
+# --- Step 1: Build correlation matrix C[k] within each condition k ---
+cat("Step 1: Computing correlation matrices for each condition...\n")
+corMatrix1 <- WGCNA::cor(datExpr1, method = "spearman", use = "pairwise.complete.obs")
+corMatrix2 <- WGCNA::cor(datExpr2, method = "spearman", use = "pairwise.complete.obs")
+
+cat("Correlation matrices computed.\n\n")
+
+# --- Step 2: Compute matrix of adjacency difference D ---
+# d_ij = |sign(cor_ij^(1))(cor_ij^(1))^2 - sign(cor_ij^(2))(cor_ij^(2))^2|^beta
+cat("Step 2: Computing the adjacency difference matrix D...\n")
+
+# Get all unique genes (should be commonGenes from above)
+allGenes <- colnames(datExpr1)
+
+# Initialize D matrix with zeros
+D_matrix <- matrix(0,
+                   nrow = length(allGenes),
+                   ncol = length(allGenes),
+                   dimnames = list(allGenes, allGenes))
+
+# Loop through all gene pairs to calculate D_ij
+for (i in 1:length(allGenes)) {
+  for (j in i:length(allGenes)) { # Loop j from i for upper triangle (and symmetry)
+    gene_i <- allGenes[i]
+    gene_j <- allGenes[j]
+
+    # Get correlations for the pair
+    cor_ij_1 <- corMatrix1[gene_i, gene_j]
+    cor_ij_2 <- corMatrix2[gene_i, gene_j]
+
+    # Handle potential NA correlations
+    # If a correlation is NA in either condition, set differential to 0 for that pair
+    if (is.na(cor_ij_1) || is.na(cor_ij_2)) {
+      D_matrix[gene_i, gene_j] <- 0
+      D_matrix[gene_j, gene_i] <- 0
+      next
+    }
+
+    # Calculate signed squared correlations
+    s_ij_1 <- sign(cor_ij_1) * (cor_ij_1^2)
+    s_ij_2 <- sign(cor_ij_2) * (cor_ij_2^2)
+
+    # Calculate d_ij as per paper's formula: |s_ij_1 - s_ij_2|^beta
+    d_ij_val <- abs(s_ij_1 - s_ij_2)^beta
+
+    # Populate D_matrix symmetrically
+    D_matrix[gene_i, gene_j] <- d_ij_val
+    D_matrix[gene_j, gene_i] <- d_ij_val # Ensure symmetry
+  }
+}
+
+cat("Adjacency difference matrix D computed. Its range is [", min(D_matrix), ", ", max(D_matrix), "]\n\n")
+
+# --- Step 3: Derive the Topological Overlap (TO) based dissimilarity matrix T from D ---
+cat("Step 3: Computing Topological Overlap Dissimilarity (TOM) from D...\n")
+
+# It's good practice to ensure the diagonal is 1 for adjacency matrices before TOM
+diag(D_matrix) <- 1 # Gene is perfectly "differentially coexpressed" with itself conceptually
+
+# Use WGCNA's TOMsimilarity function on our custom differential adjacency matrix D.
+# TOMType="unsigned" is generally appropriate for D_matrix values which are [0,1].
+TOM_matrix <- TOMsimilarity(D_matrix, TOMType = "unsigned")
+
+# Convert TOM to dissimilarity (1 - TOM)
+T_dissimilarity <- 1 - TOM_matrix
+
+cat("Topological Overlap Dissimilarity matrix T computed.\n\n")
+
+# --- Step 4: Clustering and Module Identification ---
+cat("Step 4: Performing hierarchical clustering and module identification...\n")
+
+# Hierarchical clustering
+geneTree_diffcoex <- hclust(as.dist(T_dissimilarity), method = "average")
+
+# Plot the dendrogram
+plot(geneTree_diffcoex, xlab = "", sub = "", main = "Gene dendrogram based on differential TOM",
+     labels = FALSE, hang = 0.04)
+
+# Module identification using dynamicTreeCut
+minModuleSize_diffcoex <- 10 # Adjust based on your data and desired module size
+dynamicMods_diffcoex <- cutreeDynamic(dendro = geneTree_diffcoex,
+                                      distM = T_dissimilarity,
+                                      deepSplit = 2, # Adjust deepSplit for granularity (0-4)
+                                      pamRespectsDendro = FALSE, # Set to TRUE for PAM refinement
+                                      minClusterSize = minModuleSize_diffcoex)
+
+# Assign module colors (for visualization and further analysis)
+moduleColors_diffcoex <- labels2colors(dynamicMods_diffcoex)
+
+cat("Module identification complete.\n")
+cat("Number of differential co-expression modules found:", length(unique(moduleColors_diffcoex)) - 1,
+    " (excluding grey for unassigned genes)\n") # -1 for 'grey' module
+cat("Sizes of modules:\n")
+print(table(moduleColors_diffcoex))
+
+# Output the module assignments to a data frame
+differential_modules <- data.frame(
+  Gene = colnames(datExpr1),
+  Module = moduleColors_diffcoex
+)
+
+# Save the dataframe to a CSV file
+output_file <- "diffcoexp/moduleColors_synthetic_0.1.csv"
+write.csv(differential_modules, file = output_file, row.names = F)
+cat(paste0("\nModule assignments saved to ", output_file, "\n"))
+
+# --- New Section: Plotting Module-Trait Relationships ---
+
+cat("\n--- Plotting Module-Trait Relationships ---\n")
+
+# Create a trait data frame for your samples
+# The row names of the trait data frame must match the sample names in datExpr_combined
+trait_data <- data.frame(
+  Sample = c(rownames(datExpr1), rownames(datExpr2)),
+  Condition = c(rep("Healthy", nrow(datExpr1)), rep("Diseased", nrow(datExpr2)))
+)
+rownames(trait_data) <- trait_data$Sample # Set sample names as row names
+
+# Convert categorical trait to numeric for correlation (WGCNA expects numeric)
+# 0 for Healthy, 1 for Diseased (arbitrary assignment)
+trait_numeric <- as.data.frame(as.numeric(trait_data$Condition == "Diseased"))
+rownames(trait_numeric) <- rownames(trait_data)
+colnames(trait_numeric) <- "Diseased_vs_Healthy"
+
+cat("Trait data prepared.\n")
+print(head(trait_numeric))
+cat("\n")
+
+# Calculate Module Eigengenes (MEs)
+# MEs represent the "average" expression profile of each module.
+# Use the combined expression data and the identified module colors.
+MEs_diffcoex <- moduleEigengenes(datExpr_combined, moduleColors_diffcoex)$eigengenes
+cat("Module Eigengenes calculated.\n")
+print(head(MEs_diffcoex))
+cat("\n")
+
+# Relate MEs to the trait (Condition)
+# Calculate correlations and their p-values
+moduleTraitCor <- WGCNA::cor(MEs_diffcoex, trait_numeric, use = "pairwise.complete.obs", method = "pearson") # Pearson is common for MEs
+moduleTraitPvalue <- WGCNA::corPvalueStudent(moduleTraitCor, nrow(datExpr_combined)) # Number of samples
+
+cat("Module-trait correlations and p-values calculated.\n\n")
+
+# Plotting the heatmap using labeledHeatmap
+# Customize text matrix for correlation and p-value display
+dev.off()
+png("diffcoexp/DiffCoExp_Synthetic_0.1.png",width=6,height=5,units="in",res=600)
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                    signif(moduleTraitPvalue, 1), ")", sep = "");
+                    dim(textMatrix) = dim(moduleTraitCor)
+                    par(mar = c(6, 10, 3, 3))
+par(mar = c(8, 8, 2, 1))  # Reduce margins (bottom, left, top, right)
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = "Condition",
+               yLabels = names(MEs_diffcoex),
+               ySymbols = names(MEs_diffcoex),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50), # Red for positive, blue for negative correlation
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.5, # Adjust text size
+               zlim = c(-1, 1),
+               main = paste("DiffCoEx Modules")
+               )
+
+cat("\nModule-Trait Relationship Heatmap generated.\n")
+dev.off()
+
+```
+
+## E.2 High variability (p=0.9)
+
+```{r}
+library(WGCNA)
+# WGCNA often recommends setting this
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads() # Use multiple cores if available
+
+# --- Input Data ---
+# Read expression data for two conditions
+# Ensure 'row.names = "Genes"' correctly identifies the gene ID column
+exprs.1 = read.csv("dcor-method/synthetic_healthy_0.9.txt", sep = "\t", header=T, row.names = "Genes")
+exprs.2 = read.csv("dcor-method/synthetic_diseased_0.9.txt", sep = "\t", header=T, row.names = "Genes")
+
+# Ensure gene order is consistent across conditions
+commonGenes <- intersect(rownames(exprs.1), rownames(exprs.2))
+exprs.1 <- exprs.1[commonGenes, ]
+exprs.2 <- exprs.2[commonGenes, ]
+
+# IMPORTANT for WGCNA: Transpose data so samples are rows and genes are columns
+datExpr1 <- as.data.frame(t(exprs.1))
+datExpr2 <- as.data.frame(t(exprs.2))
+
+# Combine expression data for module eigengene calculation and trait mapping
+# The column names (genes) must be identical for cbind to work correctly
+datExpr_combined <- t(cbind(exprs.1, exprs.2))
+
+cat("Data dimensions for WGCNA (samples x genes):\n")
+cat("Condition 1:", dim(datExpr1), "\n")
+cat("Condition 2:", dim(datExpr2), "\n")
+cat("Combined data:", dim(datExpr_combined), "\n\n")
+
+# --- Define Soft-thresholding Power (beta) ---
+# As per the paper, beta is a tuning parameter for the adjacency difference matrix.
+# Its choice impacts the stringency of differential correlation.
+beta = 1 # Example value, adjust as needed based on your data and desired stringency
+
+
+# ==============================================================================
+# DiffCoEx Algorithm Steps
+# ==============================================================================
+
+# --- Step 1: Build correlation matrix C[k] within each condition k ---
+cat("Step 1: Computing correlation matrices for each condition...\n")
+corMatrix1 <- WGCNA::cor(datExpr1, method = "spearman", use = "pairwise.complete.obs")
+corMatrix2 <- WGCNA::cor(datExpr2, method = "spearman", use = "pairwise.complete.obs")
+
+cat("Correlation matrices computed.\n\n")
+
+# --- Step 2: Compute matrix of adjacency difference D ---
+# d_ij = |sign(cor_ij^(1))(cor_ij^(1))^2 - sign(cor_ij^(2))(cor_ij^(2))^2|^beta
+cat("Step 2: Computing the adjacency difference matrix D...\n")
+
+# Get all unique genes (should be commonGenes from above)
+allGenes <- colnames(datExpr1)
+
+# Initialize D matrix with zeros
+D_matrix <- matrix(0,
+                   nrow = length(allGenes),
+                   ncol = length(allGenes),
+                   dimnames = list(allGenes, allGenes))
+
+# Loop through all gene pairs to calculate D_ij
+for (i in 1:length(allGenes)) {
+  for (j in i:length(allGenes)) { # Loop j from i for upper triangle (and symmetry)
+    gene_i <- allGenes[i]
+    gene_j <- allGenes[j]
+
+    # Get correlations for the pair
+    cor_ij_1 <- corMatrix1[gene_i, gene_j]
+    cor_ij_2 <- corMatrix2[gene_i, gene_j]
+
+    # Handle potential NA correlations
+    # If a correlation is NA in either condition, set differential to 0 for that pair
+    if (is.na(cor_ij_1) || is.na(cor_ij_2)) {
+      D_matrix[gene_i, gene_j] <- 0
+      D_matrix[gene_j, gene_i] <- 0
+      next
+    }
+
+    # Calculate signed squared correlations
+    s_ij_1 <- sign(cor_ij_1) * (cor_ij_1^2)
+    s_ij_2 <- sign(cor_ij_2) * (cor_ij_2^2)
+
+    # Calculate d_ij as per paper's formula: |s_ij_1 - s_ij_2|^beta
+    d_ij_val <- abs(s_ij_1 - s_ij_2)^beta
+
+    # Populate D_matrix symmetrically
+    D_matrix[gene_i, gene_j] <- d_ij_val
+    D_matrix[gene_j, gene_i] <- d_ij_val # Ensure symmetry
+  }
+}
+
+cat("Adjacency difference matrix D computed. Its range is [", min(D_matrix), ", ", max(D_matrix), "]\n\n")
+
+# --- Step 3: Derive the Topological Overlap (TO) based dissimilarity matrix T from D ---
+cat("Step 3: Computing Topological Overlap Dissimilarity (TOM) from D...\n")
+
+# It's good practice to ensure the diagonal is 1 for adjacency matrices before TOM
+diag(D_matrix) <- 1 # Gene is perfectly "differentially coexpressed" with itself conceptually
+
+# Use WGCNA's TOMsimilarity function on our custom differential adjacency matrix D.
+# TOMType="unsigned" is generally appropriate for D_matrix values which are [0,1].
+TOM_matrix <- TOMsimilarity(D_matrix, TOMType = "unsigned")
+
+# Convert TOM to dissimilarity (1 - TOM)
+T_dissimilarity <- 1 - TOM_matrix
+
+cat("Topological Overlap Dissimilarity matrix T computed.\n\n")
+
+# --- Step 4: Clustering and Module Identification ---
+cat("Step 4: Performing hierarchical clustering and module identification...\n")
+
+# Hierarchical clustering
+geneTree_diffcoex <- hclust(as.dist(T_dissimilarity), method = "average")
+
+# Plot the dendrogram
+plot(geneTree_diffcoex, xlab = "", sub = "", main = "Gene dendrogram based on differential TOM",
+     labels = FALSE, hang = 0.04)
+
+# Module identification using dynamicTreeCut
+minModuleSize_diffcoex <- 10 # Adjust based on your data and desired module size
+dynamicMods_diffcoex <- cutreeDynamic(dendro = geneTree_diffcoex,
+                                      distM = T_dissimilarity,
+                                      deepSplit = 2, # Adjust deepSplit for granularity (0-4)
+                                      pamRespectsDendro = FALSE, # Set to TRUE for PAM refinement
+                                      minClusterSize = minModuleSize_diffcoex)
+
+# Assign module colors (for visualization and further analysis)
+moduleColors_diffcoex <- labels2colors(dynamicMods_diffcoex)
+
+cat("Module identification complete.\n")
+cat("Number of differential co-expression modules found:", length(unique(moduleColors_diffcoex)) - 1,
+    " (excluding grey for unassigned genes)\n") # -1 for 'grey' module
+cat("Sizes of modules:\n")
+print(table(moduleColors_diffcoex))
+
+# Output the module assignments to a data frame
+differential_modules <- data.frame(
+  Gene = colnames(datExpr1),
+  Module = moduleColors_diffcoex
+)
+
+# Save the dataframe to a CSV file
+output_file <- "diffcoexp/moduleColors_synthetic_0.9.csv"
+write.csv(differential_modules, file = output_file, row.names = F)
+cat(paste0("\nModule assignments saved to ", output_file, "\n"))
+
+# --- New Section: Plotting Module-Trait Relationships ---
+
+cat("\n--- Plotting Module-Trait Relationships ---\n")
+
+# Create a trait data frame for your samples
+# The row names of the trait data frame must match the sample names in datExpr_combined
+trait_data <- data.frame(
+  Sample = c(rownames(datExpr1), rownames(datExpr2)),
+  Condition = c(rep("Healthy", nrow(datExpr1)), rep("Diseased", nrow(datExpr2)))
+)
+rownames(trait_data) <- trait_data$Sample # Set sample names as row names
+
+# Convert categorical trait to numeric for correlation (WGCNA expects numeric)
+# 0 for Healthy, 1 for Diseased (arbitrary assignment)
+trait_numeric <- as.data.frame(as.numeric(trait_data$Condition == "Diseased"))
+rownames(trait_numeric) <- rownames(trait_data)
+colnames(trait_numeric) <- "Diseased_vs_Healthy"
+
+cat("Trait data prepared.\n")
+print(head(trait_numeric))
+cat("\n")
+
+# Calculate Module Eigengenes (MEs)
+# MEs represent the "average" expression profile of each module.
+# Use the combined expression data and the identified module colors.
+MEs_diffcoex <- moduleEigengenes(datExpr_combined, moduleColors_diffcoex)$eigengenes
+cat("Module Eigengenes calculated.\n")
+print(head(MEs_diffcoex))
+cat("\n")
+
+# Relate MEs to the trait (Condition)
+# Calculate correlations and their p-values
+moduleTraitCor <- WGCNA::cor(MEs_diffcoex, trait_numeric, use = "pairwise.complete.obs", method = "pearson") # Pearson is common for MEs
+moduleTraitPvalue <- WGCNA::corPvalueStudent(moduleTraitCor, nrow(datExpr_combined)) # Number of samples
+
+cat("Module-trait correlations and p-values calculated.\n\n")
+
+# Plotting the heatmap using labeledHeatmap
+# Customize text matrix for correlation and p-value display
+dev.off()
+png("diffcoexp/DiffCoExp_Synthetic_0.9.png",width=6,height=5,units="in",res=600)
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                    signif(moduleTraitPvalue, 1), ")", sep = "");
+                    dim(textMatrix) = dim(moduleTraitCor)
+                    par(mar = c(6, 10, 3, 3))
+par(mar = c(8, 8, 2, 1))  # Reduce margins (bottom, left, top, right)
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = "Condition",
+               yLabels = names(MEs_diffcoex),
+               ySymbols = names(MEs_diffcoex),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50), # Red for positive, blue for negative correlation
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.5, # Adjust text size
+               zlim = c(-1, 1),
+               main = paste("DiffCoEx Modules")
+               )
+
+cat("\nModule-Trait Relationship Heatmap generated.\n")
+dev.off()
+```
+
+```{r}
+exprs.h = read.csv("dcor-method/synthetic_healthy_0.9.txt", sep = "\t", header=T, row.names = "Genes")
+exprs.d = read.csv("dcor-method/synthetic_diseased_0.9.txt", sep = "\t", header=T, row.names = "Genes")
+allowWGCNAThreads()
+
+# Diseased - Healthy; high correlation --> diseased
+res.high =diffcoexp(exprs.1 = exprs.d, exprs.2 = exprs.h,
+                   r.method = "pearson",q.method = "bonferroni")
+```
+
+# X. Precision & Recall
+
+```{r}
+evaluate_method <- function(true_positive_genes, predicted_positive_modules, gene_module_df) {
+  gene_module_df <- gene_module_df[!is.na(gene_module_df$gene) & !is.na(gene_module_df$module), ]
+  all_genes <- unique(gene_module_df$gene)
+
+  # Handle empty predicted modules
+  if (length(predicted_positive_modules) == 0) {
+    predicted_positive_genes <- character(0)
+  } else {
+    predicted_positive_genes <- gene_module_df$gene[gene_module_df$module %in% predicted_positive_modules]
+  }
+
+  TP <- sum(predicted_positive_genes %in% true_positive_genes)
+  FP <- sum(!(predicted_positive_genes %in% true_positive_genes))
+  FN <- sum(true_positive_genes %in% all_genes & !(true_positive_genes %in% predicted_positive_genes))
+  TN <- sum(!(all_genes %in% true_positive_genes) & !(all_genes %in% predicted_positive_genes))
+
+  precision <- ifelse((TP + FP) > 0, TP / (TP + FP), NA)
+  recall <- ifelse((TP + FN) > 0, TP / (TP + FN), NA)
+
+  return(data.frame(
+    TP = TP, FP = FP, TN = TN, FN = FN,
+    precision = precision,
+    recall = recall
+  ))
+}
+```
+
+## X.1 Low variability (p=0.1)
+
+```{r}
+# Inputs
+synthetic_data = read.csv("synthetic_expression_data_effect_0.1.csv", header=T)
+true_pos_diseased_genes <- synthetic_data$X[151:300]
+
+# Module mapping
+gene_module_files <- list(
+  WGCNA = "wgcna/moduleColors_WGCNA_0.1.csv",
+  DiffCoExp = "diffcoexp/moduleColors_synthetic_0.1.csv",
+  DGCA = "wgcna/moduleColors_WGCNA_0.1.csv",
+  Our_Method = list("dcor-method/modules_diseased_0.1.csv",
+                    "dcor-method/modules_healthy_0.1.csv")
+  )
+
+# Positively correlated modules
+predicted_modules_by_method = list(
+  WGCNA = character(0),
+  DiffCoExp = character(0),
+  DGCA= c("brown"),
+  Our_Method =  list(c("turquoise", "red", "magenta", "brown", "yellow", "purple"),
+                     c("yellow", "blue", "red", "brown")
+  )
+)
+
+# Evaluation loop
+results_list <- list()
+
+for (method in names(gene_module_files)) {
+  files <- gene_module_files[[method]]
+  modules <- predicted_modules_by_method[[method]]
+  
+  # Combine all dataframes for this method
+  combined_df <- data.frame()
+  
+  for (i in seq_along(files)) {
+    df <- read.csv(files[[i]], stringsAsFactors = FALSE)
+    colnames(df) <- c("gene", "module")
+
+    # Append with file ID if needed (optional)
+    combined_df <- rbind(combined_df, df)
+  }
+
+  # Remove duplicates (in case same gene appears multiple times)
+  combined_df <- unique(combined_df)
+
+  # Determine combined predicted modules
+  if (is.character(modules)) {
+    predicted_modules <- modules
+  } else if (is.list(modules)) {
+    predicted_modules <- unique(unlist(modules))
+  } else {
+    stop(paste("Invalid predicted modules format for method", method))
+  }
+
+  # Evaluate once for the combined gene-module mapping
+  res <- evaluate_method(
+    true_positive_genes = true_pos_diseased_genes,
+    predicted_positive_modules = predicted_modules,
+    gene_module_df = combined_df
+  )
+
+  results_list[[method]] <- data.frame(
+    method = method,
+    TP = res$TP,
+    FP = res$FP,
+    TN = res$TN,
+    FN = res$FN,
+    precision = res$precision*100,
+    recall = res$recall*100,
+    row.names = NULL
+  )
+}
+
+# Combine all results into one summary data frame
+summary_df <- do.call(rbind, results_list)
+rownames(summary_df) <- summary_df$method
+summary_df$method <- NULL
+
+# View results
+print(summary_df)
+```
+
+## X.2 High variability (p=0.9)
+
+```{r}
+# Inputs
+synthetic_data = read.csv("synthetic_expression_data_effect_0.9.csv", header=T)
+true_pos_diseased_genes <- synthetic_data$X[151:300]
+
+# Module mapping
+gene_module_files <- list(
+  WGCNA = "wgcna/moduleColors_WGCNA_0.9.csv",
+  DiffCoExp = "diffcoexp/moduleColors_synthetic_0.9.csv",
+  DGCA = "wgcna/moduleColors_WGCNA_0.9.csv",
+  Our_Method = list("dcor-method/modules_diseased_0.9.csv",
+                    "dcor-method/modules_healthy_0.9.csv")
+  )
+
+# Positively correlated modules
+predicted_modules_by_method = list(
+  WGCNA = c("blue", "black", "red", "magenta", "greenyellow", "purple"),
+  DiffCoExp = c("blue", "green", "greenyellow", "pink", "purple", "yellow"),
+  DGCA = c("turquoise","greenyellow","magenta","black","pink"),
+  Our_Method =  list(c("blue", "green", "pink", "brown"),
+                     c("pink", "blue", "yellow", "black")
+  )
+)
+
+# Evaluation loop
+results_list <- list()
+
+for (method in names(gene_module_files)) {
+  files <- gene_module_files[[method]]
+  modules <- predicted_modules_by_method[[method]]
+  
+  # Combine all dataframes for this method
+  combined_df <- data.frame()
+  
+  for (i in seq_along(files)) {
+    df <- read.csv(files[[i]], stringsAsFactors = FALSE)
+    colnames(df) <- c("gene", "module")
+
+    # Append with file ID if needed (optional)
+    combined_df <- rbind(combined_df, df)
+  }
+
+  # Remove duplicates (in case same gene appears multiple times)
+  combined_df <- unique(combined_df)
+
+  # Determine combined predicted modules
+  if (is.character(modules)) {
+    predicted_modules <- modules
+  } else if (is.list(modules)) {
+    predicted_modules <- unique(unlist(modules))
+  } else {
+    stop(paste("Invalid predicted modules format for method", method))
+  }
+
+  # Evaluate once for the combined gene-module mapping
+  res <- evaluate_method(
+    true_positive_genes = true_pos_diseased_genes,
+    predicted_positive_modules = predicted_modules,
+    gene_module_df = combined_df
+  )
+
+  results_list[[method]] <- data.frame(
+    method = method,
+    TP = res$TP,
+    FP = res$FP,
+    TN = res$TN,
+    FN = res$FN,
+    precision = res$precision*100,
+    recall = res$recall*100,
+    row.names = NULL
+  )
+}
+
+# Combine all results into one summary data frame
+summary_df <- do.call(rbind, results_list)
+rownames(summary_df) <- summary_df$method
+summary_df$method <- NULL
+
+# View results
+print(summary_df)
+```

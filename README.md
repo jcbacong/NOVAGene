@@ -15,6 +15,11 @@ R and Python notebooks include step-by-step computations for subsequent analyses
 Install the required Python packages:
 
 ```sh
+# Create and activate conda environment
+conda create -n novagene python=3.10
+conda activate novagene
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 

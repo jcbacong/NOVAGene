@@ -7,7 +7,7 @@ Nonlinear Overlapping Variability Analysis of Gene Networks or NOVAGene is a gen
 
 ### 💻 Computational Environment
 
-The majority of heavy computations were performed in a **SLURM-based HPC (High-Performance Computing) Linux environment**. The authors recommend using an HPC environment for full-scale analyses; however, a desktop machine with a capable GPU may be used as an alternative.
+The majority of heavy computations were performed in a **SLURM-based HPC (High-Performance Computing) Linux environment**. I personally recommend using an HPC environment for full-scale analyses; however, a desktop machine with a capable GPU may be used as an alternative.
 
 R and Python notebooks include step-by-step computations for subsequent analyses and can be run on personal computers.
 

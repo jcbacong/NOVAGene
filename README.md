@@ -110,4 +110,4 @@ If you use NOVAGene in your research, please cite our paper accordingly.
 
 ## 📬 Contact
 
-For questions or issues, please open a GitHub Issue or contact the authors directly.
+For questions or issues, please open a GitHub Issue or contact me directly at bacong.junelle@gmail.com

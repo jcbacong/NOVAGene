@@ -2,7 +2,7 @@
 
 Nonlinear Overlapping Variability Analysis of Gene Networks or NOVAGene is a gene coexpression analysis framework that extends WGCNA by incorporating nonlinear association measures. This repository contains all scripts and notebooks for reproducing the analyses presented in our study.
 
-Bacong et al (2026) NOVAGene: a nonlinear approach to improve biological resolution in weighted gene co-expression networks for low-variability datasets. Front. Bioinform. 6:1813626. doi: 10.3389/fbinf.2026.1813626
+Bacong et al (2026) NOVAGene: a nonlinear approach to improve biological resolution in weighted gene co-expression networks for low-variability datasets. _Front. Bioinform_. 6:1813626. doi: [https://doi.org/10.3389/fbinf.2026.1813626](https://doi.org/10.3389/fbinf.2026.1813626)
 
 ---
 ## Requirements
